@@ -33,6 +33,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/url"
+	"regexp"
 	"strconv"
 	"strings"
 
@@ -372,5 +373,225 @@ func makeV1Entities(body []byte, actionType string) ([]byte, int, error) {
 func copyV2LD(c *cli.Context, ngsi *ngsilib.NGSI, source, destination *ngsilib.Client, entityType string) error {
 	const funcName = "copyV2LD"
 
-	return &ngsiCmdError{funcName, 1, "not yet implemented", nil}
+	page := 0
+	limit := 100
+	total := 0
+	for {
+		// get count
+		source.SetPath("/entities")
+
+		v := url.Values{}
+		v.Set("type", entityType)
+		v.Set("options", "count")
+		v.Set("limit", fmt.Sprintf("%d", limit))
+		v.Set("offset", fmt.Sprintf("%d", page*limit))
+		source.SetQuery(&v)
+
+		res, body, err := source.HTTPGet()
+		if err != nil {
+			return &ngsiCmdError{funcName, 1, err.Error(), err}
+		}
+		if res.StatusCode != http.StatusOK {
+			return &ngsiCmdError{funcName, 2, fmt.Sprintf("%s %s", res.Status, string(body)), nil}
+		}
+
+		count, err := source.ResultsCount(res)
+		if err != nil {
+			return &ngsiCmdError{funcName, 3, "ResultsCount error", nil}
+		}
+
+		if !c.IsSet("run") {
+			fmt.Fprintf(ngsi.StdWriter, "%d entities will be copied. run copy with --run option\n", count)
+			return nil
+		}
+
+		if count == 0 {
+			break
+		}
+
+		body, err = normalized2LD(body)
+		if err != nil {
+			return &ngsiCmdError{funcName, 4, err.Error(), err}
+		}
+
+		destination.SetPath("/entityOperations/create")
+		destination.SetContentLdJSON()
+
+		if c.IsSet("context2") {
+			body, err = insertAtContext(ngsi, body, c.String("context2"))
+			if err != nil {
+				return &ngsiCmdError{funcName, 5, err.Error(), err}
+			}
+		}
+		res, body, err = destination.HTTPPost(body)
+		if err != nil {
+			return &ngsiCmdError{funcName, 6, err.Error(), err}
+		}
+		if res.StatusCode != http.StatusOK {
+			return &ngsiCmdError{funcName, 7, fmt.Sprintf("%s %s", res.Status, string(body)), nil}
+		}
+
+		total += count
+
+		if (page+1)*limit < count {
+			page = page + 1
+		} else {
+			break
+		}
+	}
+
+	fmt.Fprintln(ngsi.StdWriter, total)
+	return nil
+}
+
+// Porting of https://github.com/FIWARE/dataModels/blob/master/tools/normalized2LD.py
+
+type ldEntity map[string]interface{}
+type ldEntities []ldEntity
+
+func normalized2LD(body []byte) ([]byte, error) {
+	const funcName = "normalized2LD"
+
+	var ldEntities ldEntities
+
+	var v2Entities entitiesRespose
+	err := ngsilib.JSONUnmarshal(body, &v2Entities)
+	if err != nil {
+		return nil, &ngsiCmdError{funcName, 1, err.Error(), err}
+	}
+
+	for _, v2 := range v2Entities {
+		ld, err := normalized2LDEntity(v2)
+		if err != nil {
+			return nil, &ngsiCmdError{funcName, 2, err.Error(), err}
+		}
+		ldEntities = append(ldEntities, ld)
+	}
+
+	b, err := ngsilib.JSONMarshal(ldEntities)
+	if err != nil {
+		return nil, &ngsiCmdError{funcName, 3, err.Error(), err}
+	}
+
+	return b, nil
+}
+
+func normalized2LDEntity(v2 ngsiEntity) (ldEntity, error) {
+	var ld ldEntity
+	for key, value := range v2 {
+		switch key {
+		case "id":
+			ld[key] = value
+		}
+
+	}
+	return ld, nil
+}
+
+var (
+	uriParse = regexp.MustCompile(`(?i)^(?:[^:/?#]+)`)
+)
+
+func ngsildUri(typePart, idPart string) string {
+	id := ""
+	entityType := uriParse.FindAllStringSubmatch(idPart, -1)
+	if strings.ToLower(entityType[0][0]) == strings.ToLower(typePart) {
+		id = fmt.Sprintf("urn:ngsi-ld:%s", idPart)
+	} else {
+		id = fmt.Sprintf("urn:ngsi-ld:%s:%s", typePart, idPart)
+	}
+	return id
+}
+
+func ldId(entityId, entityType string) string {
+	scheme := uriParse.FindAllStringSubmatch(entityId, -1)
+
+	if !ngsilib.Contains([]string{"urn", "http", "https"}, scheme[0][0]) {
+		return ngsildUri(entityType, entityId)
+	}
+
+	return entityId
+}
+
+func v2ToLD(v2 ngsiEntity) ldEntity {
+	var ld ldEntity
+	ld["@context"] = ""
+
+	for key := range v2 {
+		switch key {
+		case "id":
+			ld[key] = ldId(v2["id"].(string), v2["type"].(string))
+		case "type":
+			ld[key] = v2[key]
+			/*
+				case "dateCreated":
+						ld["createdAt"] = normalizeDate(entity[key].value)
+				case "dateModified":
+						ld["modifiedAt"] = normalizeDate(entity[key].value)
+			*/
+
+		}
+	}
+	/*
+		  const attr = entity[key];
+		  out[key] = {};
+		  const ldAttr = out[key];
+
+		  if (!attr.type || attr.type !== 'Relationship') {
+				ldAttr.type = 'Property';
+				ldAttr.value = attr.value;
+		  } else {
+				ldAttr.type = 'Relationship';
+				const auxObj = attr.value;
+				if (Array.isArray(auxObj)) {
+				  ldAttr.object = [];
+
+				  for (const obj in auxObj) {
+						ldAttr.object.push(ldObject(key, auxObj[obj]));
+				  }
+				} else {
+				  ldAttr.object = ldObject(key, String(auxObj));
+				}
+		  }
+
+		  if (key === 'location') {
+				ldAttr.type = 'GeoProperty';
+		  }
+
+		  if (attr.type && attr.type === 'DateTime') {
+				ldAttr.value = {
+				  '@type': 'DateTime',
+				  '@value': normalizeDate(attr.value)
+				};
+		  }
+
+		  if (attr.type && attr.type === 'PostalAddress') {
+				ldAttr.value.type = 'PostalAddress';
+		  }
+
+		  if (attr.metadata) {
+				const metadata = attr.metadata;
+				for (const mkey in metadata) {
+				  if (mkey === 'timestamp') {
+						ldAttr.observedAt = normalizeDate(metadata[mkey].value);
+				  } else if (mkey === 'unitCode') {
+						ldAttr.unitCode = metadata[mkey].value;
+				  } else {
+						const subAttr = {};
+						subAttr.type = 'Property';
+						subAttr.value = metadata[mkey].value;
+						ldAttr[mkey] = subAttr;
+				  }
+				}
+		  }
+		}
+	*/
+	return ld
+}
+
+func normalizeDate(dateStr string) string {
+	if !strings.HasSuffix(dateStr, "Z") {
+		return dateStr + "Z"
+	}
+	return dateStr
 }
